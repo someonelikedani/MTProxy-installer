@@ -10,6 +10,7 @@ set -euo pipefail
 # - Optional anti-abuse injects rules into EXISTING firewall chains only (no new hook chains)
 # - Installer self-update is gated by trusted remote URL check (supply-chain hardening)
 # - Public IP detection prefers local routing; external services are best-effort and can be disabled
+# - Systemd unit uses a dedicated writable StateDirectory to avoid sandbox write issues
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER_SELF_UPDATE="${INSTALLER_SELF_UPDATE:-1}"
@@ -50,7 +51,8 @@ CANDIDATE_STATS_PORTS=(8888 8889 8890 18080 19080 28080)
 ABUSE_MARKER="mtproxy_installer_abuse_protection"
 ABUSE_BACKEND="none"
 
-log(){ echo -e "[mtproxy] $*"; }
+# IMPORTANT: log to stderr so functions can safely echo machine-readable values to stdout.
+log(){ echo -e "[mtproxy] $*" >&2; }
 warn(){ echo -e "[mtproxy] WARN: $*" >&2; }
 die(){ echo -e "[mtproxy] ERROR: $*" >&2; exit 1; }
 have_cmd(){ command -v "$1" >/dev/null 2>&1; }
@@ -58,7 +60,8 @@ have_cmd(){ command -v "$1" >/dev/null 2>&1; }
 need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root (or via sudo)."; }
 
 service_installed(){
-  systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "${SERVICE_UNIT}"
+  # More reliable than parsing list-unit-files output
+  systemctl cat "${SERVICE_UNIT}" >/dev/null 2>&1
 }
 service_active(){ systemctl is-active --quiet "${SERVICE_NAME}"; }
 
@@ -214,9 +217,12 @@ apply_abuse_nft_existing(){
   local c1="${ABUSE_MARKER}_syn_rate"
   local c2="${ABUSE_MARKER}_accept_port"
 
-  nft list chain inet filter input | grep -q "$c1" ||     nft add rule inet filter input tcp dport $port tcp flags syn ct state new       limit rate over ${NEW_CONNS_PER_SEC}/second burst ${BURST_NEW_CONNS} packets drop comment "$c1"
+  nft list chain inet filter input | grep -q "$c1" || \
+    nft add rule inet filter input tcp dport $port tcp flags syn ct state new \
+      limit rate over ${NEW_CONNS_PER_SEC}/second burst ${BURST_NEW_CONNS} packets drop comment "$c1"
 
-  nft list chain inet filter input | grep -q "$c2" ||     nft add rule inet filter input tcp dport $port accept comment "$c2"
+  nft list chain inet filter input | grep -q "$c2" || \
+    nft add rule inet filter input tcp dport $port accept comment "$c2"
 
   ABUSE_BACKEND="nft"
 }
@@ -231,12 +237,15 @@ remove_abuse_nft_existing(){
 apply_abuse_iptables(){
   local port="$1"
   iptables -N MTPROXY_ABUSE 2>/dev/null || true
-  iptables -C INPUT -p tcp --dport "$port" -j MTPROXY_ABUSE 2>/dev/null ||     iptables -I INPUT -p tcp --dport "$port" -j MTPROXY_ABUSE
+  iptables -C INPUT -p tcp --dport "$port" -j MTPROXY_ABUSE 2>/dev/null || \
+    iptables -I INPUT -p tcp --dport "$port" -j MTPROXY_ABUSE
 
-  iptables -C MTPROXY_ABUSE -p tcp --syn -m hashlimit --hashlimit-above "${NEW_CONNS_PER_SEC}/second" --hashlimit-burst "$BURST_NEW_CONNS" --hashlimit-mode srcip --hashlimit-name mtproxy_syn -j DROP 2>/dev/null ||     iptables -A MTPROXY_ABUSE -p tcp --syn -m hashlimit --hashlimit-above "${NEW_CONNS_PER_SEC}/second" --hashlimit-burst "$BURST_NEW_CONNS" --hashlimit-mode srcip --hashlimit-name mtproxy_syn -j DROP
+  iptables -C MTPROXY_ABUSE -p tcp --syn -m hashlimit --hashlimit-above "${NEW_CONNS_PER_SEC}/second" --hashlimit-burst "$BURST_NEW_CONNS" --hashlimit-mode srcip --hashlimit-name mtproxy_syn -j DROP 2>/dev/null || \
+    iptables -A MTPROXY_ABUSE -p tcp --syn -m hashlimit --hashlimit-above "${NEW_CONNS_PER_SEC}/second" --hashlimit-burst "$BURST_NEW_CONNS" --hashlimit-mode srcip --hashlimit-name mtproxy_syn -j DROP
 
   if [[ "${MAX_CONNS_PER_IP}" =~ ^[0-9]+$ ]] && [[ "${MAX_CONNS_PER_IP}" -gt 0 ]]; then
-    iptables -C MTPROXY_ABUSE -p tcp -m connlimit --connlimit-above "$MAX_CONNS_PER_IP" --connlimit-mask 32 -j DROP 2>/dev/null ||       iptables -A MTPROXY_ABUSE -p tcp -m connlimit --connlimit-above "$MAX_CONNS_PER_IP" --connlimit-mask 32 -j DROP
+    iptables -C MTPROXY_ABUSE -p tcp -m connlimit --connlimit-above "$MAX_CONNS_PER_IP" --connlimit-mask 32 -j DROP 2>/dev/null || \
+      iptables -A MTPROXY_ABUSE -p tcp -m connlimit --connlimit-above "$MAX_CONNS_PER_IP" --connlimit-mask 32 -j DROP
   fi
 
   iptables -C MTPROXY_ABUSE -j ACCEPT 2>/dev/null || iptables -A MTPROXY_ABUSE -j ACCEPT
@@ -280,6 +289,13 @@ status_cmd(){
   need_root
   echo "== MTProxy status =="
   echo
+
+  # Load state first (so ports are known for listener checks)
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+  fi
+
   echo "---- Service ----"
   if service_installed; then
     systemctl status "${SERVICE_NAME}" --no-pager -l || true
@@ -290,14 +306,15 @@ status_cmd(){
   echo
   echo "---- Listening ports ----"
   if have_cmd ss; then
-    ss -lntp 2>/dev/null | grep -E 'mtproto-proxy|:('"${CLIENT_PORT:-8443}"'|'"${STATS_PORT:-8888}"')' || echo "No mtproto-proxy listener found via ss"
+    local cport="${CLIENT_PORT:-8443}"
+    local sport="${STATS_PORT:-8888}"
+    ss -lntp 2>/dev/null | grep -E "(:${cport}\b|:${sport}\b).*mtproto-proxy" || echo "No mtproto-proxy listener found via ss"
   else
     echo "ss not available"
   fi
 
   echo
   if [[ -f "$STATE_FILE" ]]; then
-    source "$STATE_FILE"
     echo "---- Saved config ($STATE_FILE) ----"
     echo "  MT_REF: ${MT_REF:-<default-branch>}"
     echo "  MT_COMMIT: ${MT_COMMIT:-unknown}"
@@ -334,11 +351,12 @@ check_cmd(){
   if [[ -d "${MT_DIR}/.git" ]] && have_cmd git; then
     echo "MTProxy repo: $MT_DIR"
     local cur_commit cur_branch
-    cur_commit="$(git -C "$MT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
-    cur_branch="$(git -C "$MT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    cur_commit="$(git_mt rev-parse --short HEAD 2>/dev/null || true)"
+    cur_branch="$(git_mt rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     echo "  Current commit: ${cur_commit:-unknown}"
     echo "  Current branch: ${cur_branch:-unknown}"
     if [[ -f "$STATE_FILE" ]]; then
+      # shellcheck disable=SC1090
       source "$STATE_FILE"
       echo "  Saved MT_REF: ${MT_REF:-<default-branch>}"
       echo "  Saved MT_COMMIT: ${MT_COMMIT:-unknown}"
@@ -357,6 +375,7 @@ rollback(){
 
   local p=""
   if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
     source "$STATE_FILE" || true
     p="${CLIENT_PORT:-}"
   fi
@@ -409,10 +428,12 @@ prepare_user(){
 clone_and_checkout(){
   [[ -d "$MT_DIR" ]] && rm -rf "$MT_DIR"
   mkdir -p "$MT_DIR"
-  chown -R "$RUN_USER":"$RUN_USER" "$MT_DIR" || true
 
   log "Cloning MTProxy repo..."
   git clone --recursive "$REPO_URL" "$MT_DIR"
+
+  # Ensure mtproxy user can read the repo; root keeps control of install actions.
+  chown -R "$RUN_USER":"$RUN_USER" "$MT_DIR" || true
 
   if [[ -n "$MT_REF" ]]; then
     log "Pinning MTProxy to ref: $MT_REF"
@@ -426,9 +447,9 @@ clone_and_checkout(){
 
 build_mtproxy(){
   local commit
-  commit="$(git -C "$MT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+  commit="$(git_mt rev-parse --short HEAD 2>/dev/null || true)"
   log "Building MTProxy (commit: ${commit:-unknown})..."
-  make -C "$MT_DIR" COMMIT="${commit:-}" || make -C "$MT_DIR"
+  make -C "$MT_DIR" COMMIT="${commit:-}" >&2 || make -C "$MT_DIR" >&2
   echo "$commit"
 }
 
@@ -440,6 +461,8 @@ write_systemd(){
 
   [[ -x "$bin" ]] || die "mtproto-proxy not found after build."
 
+  # Use a dedicated writable directory managed by systemd.
+  # This avoids sandbox issues (ProtectSystem=full, etc.) on different MTProxy builds.
   log "Writing systemd unit: $SERVICE_FILE"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -450,7 +473,11 @@ After=network.target
 Type=simple
 User=$RUN_USER
 Group=$RUN_USER
-WorkingDirectory=$MT_DIR
+
+StateDirectory=mtproxy
+WorkingDirectory=/var/lib/mtproxy
+ReadWritePaths=/var/lib/mtproxy
+
 ExecStart=$bin -u $RUN_USER -p $stats_port -H $client_port -S $raw_secret --aes-pwd $MT_DIR/proxy-secret $MT_DIR/proxy-multi.conf -M 1
 Restart=on-failure
 RestartSec=2
@@ -483,7 +510,7 @@ start_service(){
   if ! service_active; then
     log "Service failed to start:"
     systemctl status "$SERVICE_NAME" --no-pager -l || true
-    journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
+    journalctl -u "$SERVICE_NAME" -n 200 --no-pager || true
     exit 1
   fi
 }
@@ -518,7 +545,6 @@ download_proxy_files(){
   chmod 644 "$secret_dst" "$conf_dst"
 }
 
-
 save_state(){
   local mt_commit="$1" ip="$2" cport="$3" sport="$4" lsecret="$5"
   umask 077
@@ -547,6 +573,7 @@ EOF
 
 update_existing(){
   [[ -f "$STATE_FILE" ]] || die "State file not found ($STATE_FILE). Cannot update safely."
+  # shellcheck disable=SC1090
   source "$STATE_FILE"
 
   SERVER_IP="${SERVER_IP:-$(detect_public_ipv4 || true)}"
@@ -746,6 +773,7 @@ main(){
     systemctl daemon-reload 2>/dev/null || true
 
     if [[ -f "$STATE_FILE" ]]; then
+      # shellcheck disable=SC1090
       source "$STATE_FILE" || true
       [[ -n "${CLIENT_PORT:-}" ]] && have_cmd nft && remove_abuse_nft_existing || true
       [[ -n "${CLIENT_PORT:-}" ]] && have_cmd iptables && remove_abuse_iptables_for_port "$CLIENT_PORT" || true
