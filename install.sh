@@ -144,6 +144,35 @@ Available commands:
 EOF
 }
 
+firewall_connectivity_hint(){
+  local port="$1"
+  local warned=0
+
+  if have_cmd ufw; then
+    local ufw_state
+    ufw_state="$(ufw status 2>/dev/null | head -n1 || true)"
+    if [[ "$ufw_state" =~ [Aa]ctive ]]; then
+      if ! ufw status 2>/dev/null | grep -Eq "${port}/tcp\s+ALLOW"; then
+        warn "UFW is active, but TCP/${port} does not look allowed."
+        warn "Allow it with: ufw allow ${port}/tcp"
+        warned=1
+      fi
+    fi
+  fi
+
+  if have_cmd firewall-cmd && systemctl is-active --quiet firewalld; then
+    if ! firewall-cmd --quiet --query-port="${port}/tcp"; then
+      warn "firewalld is active, but TCP/${port} is not open."
+      warn "Open it with: firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload"
+      warned=1
+    fi
+  fi
+
+  if [[ "$warned" == "1" ]]; then
+    warn "If your VPS provider has a cloud firewall/security group, open TCP/${port} there as well."
+  fi
+}
+
 git_mt(){
   git -c safe.directory="${MT_DIR}" -C "${MT_DIR}" "$@"
 }
@@ -613,6 +642,7 @@ update_existing(){
   log "Telegram links:"
   print_links "$SERVER_IP" "$CLIENT_PORT" "$LINK_SECRET"
   echo
+  firewall_connectivity_hint "$CLIENT_PORT"
   print_commands
 }
 
@@ -671,6 +701,7 @@ install_fresh(){
   log "Telegram links:"
   print_links "$SERVER_IP" "$CLIENT_PORT" "$link_secret"
   echo
+  firewall_connectivity_hint "$CLIENT_PORT"
   print_commands
 }
 
