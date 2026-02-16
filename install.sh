@@ -1,91 +1,456 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# MTProxy Installer (Ubuntu/Debian)
+# MTProxy Installer (Ubuntu / Debian)
+#
 # Default behavior: DOES NOT touch firewall.
 # Optional minimal anti-abuse protection (rate limits) can be enabled explicitly via --anti-abuse.
 #
-# Key improvements (security/ops):
-# - No global git config changes (no git --global safe.directory)
-# - Optional anti-abuse injects rules into EXISTING firewall chains only (no new hook chains)
-# - Installer self-update is gated by trusted remote URL check (supply-chain hardening)
-# - Public IP detection prefers local routing; external services are best-effort and can be disabled
+# Design goals:
+# - Minimal changes to the system
+# - No hidden firewall modifications (off by default)
+# - Deterministic production builds (pin by tag/commit)
+# - Explicit, transparent security model
+# - No changes to global git configuration
+#
+# Upstream:   https://github.com/TelegramMessenger/MTProxy
+# Installer:  https://github.com/someonelikedani/MTProxy-installer
 
-# MTProxy installer (Ubuntu/Debian)
-# Fixes the common crash:
-#   common/pid.c:42: init_common_PID: Assertion `!(p & 0xffff0000)' failed.
-# by ensuring kernel.pid_max <= 65535 (PIDs < 65536).
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+YES="${YES:-0}"
 
 MT_DIR="${MT_DIR:-/opt/MTProxy}"
 REPO_URL="${REPO_URL:-https://github.com/TelegramMessenger/MTProxy}"
 SERVICE_NAME="mtproxy"
-SERVICE_FILE="${SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAME}.service}"
+SERVICE_UNIT="${SERVICE_NAME}.service"
+SERVICE_FILE="${SERVICE_FILE:-/etc/systemd/system/${SERVICE_UNIT}}"
 RUN_USER="${RUN_USER:-mtproxy}"
 STATE_FILE="${STATE_FILE:-/etc/mtproxy-installer.env}"
 
-SERVER_IP="${SERVER_IP:-}"  # optional override
-CLIENT_PORT="${CLIENT_PORT:-8443}"
-STATS_PORT="${STATS_PORT:-8888}"
-MT_REF="${MT_REF:-}"        # optional tag/commit
-YES="${YES:-0}"
+# Version pinning (can be set via CLI --ref or env MT_REF)
+MT_REF="${MT_REF:-}"
 
-log(){ echo "[mtproxy] $*" >&2; }
-warn(){ echo "[mtproxy] WARN: $*" >&2; }
-die(){ echo "[mtproxy] ERROR: $*" >&2; exit 1; }
+# IP / ports
+SERVER_IP="${SERVER_IP:-}"
+NO_EXTERNAL_IP_LOOKUP="${NO_EXTERNAL_IP_LOOKUP:-0}" # 1 => do not query external IP services
+CLIENT_PORT="${CLIENT_PORT:-}"
+STATS_PORT="${STATS_PORT:-}"
+
+CANDIDATE_CLIENT_PORTS=(8443 9443 10443 12443 23443 32443 41443)
+CANDIDATE_STATS_PORTS=(8888 8889 8890 18080 19080 28080)
+
+# Self-update (disabled by default unless trusted URL set)
+INSTALLER_SELF_UPDATE="${INSTALLER_SELF_UPDATE:-1}"
+INSTALLER_REMOTE="${INSTALLER_REMOTE:-origin}"
+INSTALLER_BRANCH="${INSTALLER_BRANCH:-}"
+INSTALLER_TRUSTED_REMOTE_URL="${INSTALLER_TRUSTED_REMOTE_URL:-}" # empty => self-update disabled unless explicitly trusted
+INSTALLER_ALLOW_UNTRUSTED_REMOTE="${INSTALLER_ALLOW_UNTRUSTED_REMOTE:-0}" # 1 => allow self-update even if URL mismatch
+
+# Anti-abuse (OFF by default)
+ANTI_ABUSE="${ANTI_ABUSE:-0}"  # set via --anti-abuse
+ABUSE_BACKEND_PREFERRED="${ABUSE_BACKEND_PREFERRED:-auto}" # auto|nft|iptables
+NEW_CONNS_PER_SEC="${NEW_CONNS_PER_SEC:-30}"
+BURST_NEW_CONNS="${BURST_NEW_CONNS:-60}"
+MAX_CONNS_PER_IP="${MAX_CONNS_PER_IP:-0}"  # iptables-only; 0 disables
+ABUSE_MARKER="mtproxy_installer_abuse_protection"
+ABUSE_BACKEND="none"
+
+log(){ echo -e "[mtproxy] $*" >&2; }
+warn(){ echo -e "[mtproxy] WARN: $*" >&2; }
+die(){ echo -e "[mtproxy] ERROR: $*" >&2; exit 1; }
 have_cmd(){ command -v "$1" >/dev/null 2>&1; }
+
 need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root (or via sudo)."; }
+service_installed(){ systemctl cat "${SERVICE_UNIT}" >/dev/null 2>&1; }
+service_active(){ systemctl is-active --quiet "${SERVICE_NAME}"; }
+is_tty(){ [[ -t 0 && -t 1 ]]; }
 
 confirm(){
-  [[ "$YES" == "1" ]] && return 0
+  local prompt="$1"
+  [[ "${YES}" == "1" ]] && return 0
+  if ! is_tty; then
+    die "Non-interactive mode: confirmation required. Re-run with --yes (or YES=1)."
+  fi
   local ans=""
-  read -r -p "$1 (y/N): " ans || true
-  [[ "$ans" == "y" || "$ans" == "Y" ]] || die "Aborted.";
+  read -r -p "$prompt (y/N): " ans || true
+  [[ "$ans" == "y" || "$ans" == "Y" ]] || die "Aborted by user."
 }
 
-# ---------- helpers ----------
-detect_public_ipv4(){
-  local ip=""
+is_tcp_port_free(){
+  local p="$1"
+  if have_cmd ss; then
+    ss -lnt "( sport = :$p )" 2>/dev/null | grep -q ":$p" && return 1 || return 0
+  elif have_cmd netstat; then
+    netstat -lnt 2>/dev/null | grep -q ":$p " && return 1 || return 0
+  else
+    return 0
+  fi
+}
+
+pick_free_port(){
+  local -n arr=$1
+  local p
+  for p in "${arr[@]}"; do
+    if is_tcp_port_free "$p"; then echo "$p"; return 0; fi
+  done
+  return 1
+}
+
+detect_local_ipv4(){
   if have_cmd ip; then
-    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+    local ipaddr=""
+    ipaddr="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+    ipaddr="$(echo "$ipaddr" | tr -d '[:space:]')"
+    [[ "$ipaddr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$ipaddr"; return 0; }
   fi
-  ip="${ip//[[:space:]]/}"
-  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$ip"; return 0; }
+  return 1
+}
+
+detect_public_ipv4_external(){
+  [[ "$NO_EXTERNAL_IP_LOOKUP" == "1" ]] && return 1
+  local ip=""
   if have_cmd curl; then
-    ip="$(curl -fsS --max-time 5 https://api.ipify.org || true)"
+    ip="$(curl -fsS --max-time 3 https://api.ipify.org || true)"
+    [[ -z "$ip" ]] && ip="$(curl -fsS --max-time 3 https://icanhazip.com || true)"
+    [[ -z "$ip" ]] && ip="$(curl -fsS --max-time 3 https://ifconfig.me/ip || true)"
+  elif have_cmd wget; then
+    ip="$(wget -qO- --timeout=3 https://api.ipify.org || true)"
   fi
-  ip="${ip//[[:space:]]/}"
+  ip="$(echo "$ip" | tr -d '[:space:]')"
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$ip"; return 0; }
   return 1
 }
 
-ensure_pid_max(){
-  # MTProxy (some builds) expects PID < 65536.
-  local cur=""
-  [[ -r /proc/sys/kernel/pid_max ]] || return 0
-  cur="$(cat /proc/sys/kernel/pid_max 2>/dev/null || true)"
-  [[ "$cur" =~ ^[0-9]+$ ]] || return 0
+detect_public_ipv4(){
+  detect_local_ipv4 && return 0
+  detect_public_ipv4_external && return 0
+  return 1
+}
 
-  if [[ "$cur" -gt 65535 ]]; then
-    warn "kernel.pid_max=$cur (>65535). MTProxy may crash with init_common_PID assertion."
-    confirm "Set kernel.pid_max=65535 now and persist in /etc/sysctl.d/99-mtproxy.conf?"
+print_links(){
+  local ip="$1" port="$2" secret="$3"
+  echo "tg://proxy?server=$ip&port=$port&secret=$secret"
+  echo "https://t.me/proxy?server=$ip&port=$port&secret=$secret"
+}
 
-    mkdir -p /etc/sysctl.d
-    cat > /etc/sysctl.d/99-mtproxy.conf <<'CONF'
-# MTProxy compatibility: keep PIDs below 65536
-kernel.pid_max = 65535
-CONF
+print_commands(){
+  cat <<EOF
+Available commands:
+  sudo ./${0##*/} status
+  sudo ./${0##*/} check
+  sudo ./${0##*/} uninstall
+  sudo systemctl status ${SERVICE_NAME} --no-pager -l
+  sudo journalctl -u ${SERVICE_NAME} -f
+  sudo systemctl restart ${SERVICE_NAME}
+EOF
+}
 
-    if have_cmd sysctl; then
-      sysctl -w kernel.pid_max=65535 >/dev/null
-      sysctl --system >/dev/null 2>&1 || true
-    else
-      echo 65535 > /proc/sys/kernel/pid_max || true
+firewall_connectivity_hint(){
+  local port="$1"
+  local warned=0
+
+  if have_cmd ufw; then
+    local ufw_state
+    ufw_state="$(ufw status 2>/dev/null | head -n1 || true)"
+    if [[ "$ufw_state" =~ [Aa]ctive ]]; then
+      if ! ufw status 2>/dev/null | grep -Eq "${port}/tcp\s+ALLOW"; then
+        warn "UFW is active, but TCP/${port} does not look allowed."
+        warn "Allow it with: ufw allow ${port}/tcp"
+        warned=1
+      fi
     fi
+  fi
 
-    log "kernel.pid_max is now: $(cat /proc/sys/kernel/pid_max 2>/dev/null || echo '?')"
+  if have_cmd firewall-cmd && systemctl is-active --quiet firewalld; then
+    if ! firewall-cmd --quiet --query-port="${port}/tcp"; then
+      warn "firewalld is active, but TCP/${port} is not open."
+      warn "Open it with: firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload"
+      warned=1
+    fi
+  fi
+
+  [[ "$warned" == "1" ]] && warn "If your VPS provider has a cloud firewall/security group, open TCP/${port} there as well."
+}
+
+git_mt(){ git -c safe.directory="${MT_DIR}" -C "${MT_DIR}" "$@"; }
+
+trusted_remote_ok(){
+  [[ -d "${SCRIPT_DIR}/.git" ]] || return 1
+  have_cmd git || return 1
+  local url
+  url="$(git -C "$SCRIPT_DIR" remote get-url "$INSTALLER_REMOTE" 2>/dev/null || true)"
+  [[ -n "$url" ]] || return 1
+
+  if [[ "${INSTALLER_ALLOW_UNTRUSTED_REMOTE}" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ -z "${INSTALLER_TRUSTED_REMOTE_URL}" ]]; then
+    warn "Self-update is disabled: INSTALLER_TRUSTED_REMOTE_URL is not set."
+    warn "Set it to your published repo URL to enable self-update safely."
+    return 1
+  fi
+
+  if [[ "$url" != "${INSTALLER_TRUSTED_REMOTE_URL}" ]]; then
+    warn "Self-update blocked: remote URL mismatch."
+    warn "  Expected: ${INSTALLER_TRUSTED_REMOTE_URL}"
+    warn "  Current:  ${url}"
+    warn "Set INSTALLER_TRUSTED_REMOTE_URL correctly or set INSTALLER_ALLOW_UNTRUSTED_REMOTE=1 to override."
+    return 1
+  fi
+  return 0
+}
+
+self_update_if_possible(){
+  [[ "${INSTALLER_SELF_UPDATE}" == "1" ]] || return 0
+  [[ "${SELF_UPDATED:-0}" == "1" ]] && return 0
+  [[ -d "${SCRIPT_DIR}/.git" ]] || return 0
+  have_cmd git || return 0
+
+  trusted_remote_ok || return 0
+
+  local branch=""
+  branch="${INSTALLER_BRANCH:-$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)}"
+  [[ -n "$branch" ]] || return 0
+
+  log "Self-update: checking installer repo (${INSTALLER_REMOTE}/${branch})..."
+  git -C "$SCRIPT_DIR" fetch --prune "$INSTALLER_REMOTE" "$branch" >/dev/null 2>&1 || return 0
+
+  local local_sha remote_sha
+  local_sha="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+  remote_sha="$(git -C "$SCRIPT_DIR" rev-parse "${INSTALLER_REMOTE}/${branch}")"
+  if [[ "$local_sha" != "$remote_sha" ]]; then
+    log "Self-update: updating installer to latest (${remote_sha:0:7})..."
+    git -C "$SCRIPT_DIR" pull --rebase "$INSTALLER_REMOTE" "$branch"
+    log "Self-update: re-executing updated installer."
+    SELF_UPDATED=1 exec "$SCRIPT_DIR/${0##*/}" "$@"
   fi
 }
 
+installer_version(){
+  if [[ -d "${SCRIPT_DIR}/.git" ]] && have_cmd git; then
+    git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null || true
+  fi
+}
+
+# --- pid_max handling (fix for init_common_PID assertion) ---
+pid_max_warn_and_fix(){
+  have_cmd sysctl || return 0
+  local cur=""
+  cur="$(sysctl -n kernel.pid_max 2>/dev/null || true)"
+  [[ "$cur" =~ ^[0-9]+$ ]] || return 0
+  if (( cur > 65535 )); then
+    warn "kernel.pid_max=${cur} (>65535). MTProxy may crash with init_common_PID assertion."
+    if [[ "${YES}" == "1" ]]; then
+      log "Setting kernel.pid_max=65535 now and persisting in /etc/sysctl.d/99-mtproxy.conf"
+      sysctl -w kernel.pid_max=65535 >/dev/null
+      mkdir -p /etc/sysctl.d
+      cat > /etc/sysctl.d/99-mtproxy.conf <<'EOF'
+# MTProxy expects PID values to fit into 16-bit space in some builds.
+kernel.pid_max = 65535
+EOF
+      sysctl --system >/dev/null 2>&1 || true
+    else
+      confirm "Set kernel.pid_max=65535 now and persist in /etc/sysctl.d/99-mtproxy.conf?"
+      sysctl -w kernel.pid_max=65535 >/dev/null
+      mkdir -p /etc/sysctl.d
+      cat > /etc/sysctl.d/99-mtproxy.conf <<'EOF'
+# MTProxy expects PID values to fit into 16-bit space in some builds.
+kernel.pid_max = 65535
+EOF
+      sysctl --system >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+# --- Anti-abuse firewall rules (optional) ---
+nft_can_use_existing_input(){ nft list chain inet filter input >/dev/null 2>&1; }
+
+apply_abuse_nft_existing(){
+  local port="$1"
+  nft_can_use_existing_input || die "nftables 'inet filter input' chain not found. Configure firewall first or use iptables backend."
+
+  local c1="${ABUSE_MARKER}_syn_rate"
+  local c2="${ABUSE_MARKER}_accept_port"
+
+  nft list chain inet filter input | grep -q "$c1" || \
+    nft add rule inet filter input tcp dport $port tcp flags syn ct state new \
+      limit rate over ${NEW_CONNS_PER_SEC}/second burst ${BURST_NEW_CONNS} packets drop comment "$c1"
+
+  nft list chain inet filter input | grep -q "$c2" || \
+    nft add rule inet filter input tcp dport $port accept comment "$c2"
+
+  ABUSE_BACKEND="nft"
+}
+
+remove_abuse_nft_existing(){
+  nft list chain inet filter input >/dev/null 2>&1 || return 0
+  while read -r handle; do
+    [[ -n "$handle" ]] && nft delete rule inet filter input handle "$handle" || true
+  done < <(nft -a list chain inet filter input 2>/dev/null | awk -v m="$ABUSE_MARKER" '$0 ~ m {print $NF}')
+}
+
+apply_abuse_iptables(){
+  local port="$1"
+  iptables -N MTPROXY_ABUSE 2>/dev/null || true
+  iptables -C INPUT -p tcp --dport "$port" -j MTPROXY_ABUSE 2>/dev/null || \
+    iptables -I INPUT -p tcp --dport "$port" -j MTPROXY_ABUSE
+
+  iptables -C MTPROXY_ABUSE -p tcp --syn -m hashlimit --hashlimit-above "${NEW_CONNS_PER_SEC}/second" --hashlimit-burst "$BURST_NEW_CONNS" --hashlimit-mode srcip --hashlimit-name mtproxy_syn -j DROP 2>/dev/null || \
+    iptables -A MTPROXY_ABUSE -p tcp --syn -m hashlimit --hashlimit-above "${NEW_CONNS_PER_SEC}/second" --hashlimit-burst "$BURST_NEW_CONNS" --hashlimit-mode srcip --hashlimit-name mtproxy_syn -j DROP
+
+  if [[ "${MAX_CONNS_PER_IP}" =~ ^[0-9]+$ ]] && [[ "${MAX_CONNS_PER_IP}" -gt 0 ]]; then
+    iptables -C MTPROXY_ABUSE -p tcp -m connlimit --connlimit-above "$MAX_CONNS_PER_IP" --connlimit-mask 32 -j DROP 2>/dev/null || \
+    iptables -A MTPROXY_ABUSE -p tcp -m connlimit --connlimit-above "$MAX_CONNS_PER_IP" --connlimit-mask 32 -j DROP
+  fi
+
+  iptables -C MTPROXY_ABUSE -j ACCEPT 2>/dev/null || iptables -A MTPROXY_ABUSE -j ACCEPT
+  ABUSE_BACKEND="iptables"
+}
+
+remove_abuse_iptables_for_port(){
+  local port="$1"
+  iptables -D INPUT -p tcp --dport "$port" -j MTPROXY_ABUSE 2>/dev/null || true
+  iptables -F MTPROXY_ABUSE 2>/dev/null || true
+  iptables -X MTPROXY_ABUSE 2>/dev/null || true
+}
+
+apply_anti_abuse_if_enabled(){
+  local port="$1"
+  [[ "$ANTI_ABUSE" == "1" ]] || { ABUSE_BACKEND="none"; return 0; }
+
+  confirm "Anti-abuse will modify firewall rules for TCP/${port}. Continue?"
+
+  log "Anti-abuse is ENABLED (minimal rate limits). Backend preference: ${ABUSE_BACKEND_PREFERRED}"
+  case "$ABUSE_BACKEND_PREFERRED" in
+    nft)
+      have_cmd nft || die "Requested backend nft, but 'nft' not found."
+      apply_abuse_nft_existing "$port"
+      ;;
+    iptables)
+      have_cmd iptables || die "Requested backend iptables, but 'iptables' not found."
+      apply_abuse_iptables "$port"
+      ;;
+    auto|*)
+      if have_cmd nft && nft_can_use_existing_input; then apply_abuse_nft_existing "$port"
+      elif have_cmd iptables; then apply_abuse_iptables "$port"
+      else die "Anti-abuse enabled, but no suitable backend found (need nft with inet filter input, or iptables)."
+      fi
+      ;;
+  esac
+  log "Anti-abuse backend in use: $ABUSE_BACKEND"
+}
+
+# --- commands ---
+status_cmd(){
+  need_root
+  echo "== MTProxy status =="
+  echo
+
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+  fi
+
+  echo "---- Service ----"
+  if service_installed; then
+    systemctl status "${SERVICE_NAME}" --no-pager -l || true
+  else
+    echo "Service: not installed"
+  fi
+
+  echo
+  echo "---- Listening ports ----"
+  if have_cmd ss; then
+    local cport="${CLIENT_PORT:-8443}"
+    local sport="${STATS_PORT:-8888}"
+    ss -lntp 2>/dev/null | grep -E "(:${cport}\b|:${sport}\b).*mtproto-proxy" || echo "No mtproto-proxy listener found via ss"
+  else
+    echo "ss not available"
+  fi
+
+  echo
+  if [[ -f "$STATE_FILE" ]]; then
+    echo "---- Saved config ($STATE_FILE) ----"
+    echo "  MT_REF: ${MT_REF:-<default-branch>}"
+    echo "  MT_COMMIT: ${MT_COMMIT:-unknown}"
+    echo "  IP: ${SERVER_IP:-}"
+    echo "  Client port: ${CLIENT_PORT:-}"
+    echo "  Stats port: ${STATS_PORT:-}"
+    echo "  Secret: ${LINK_SECRET:-}"
+    echo "  Anti-abuse enabled: ${ANTI_ABUSE:-0} (backend: ${ABUSE_BACKEND:-})"
+    echo "  Limits: new/s=${NEW_CONNS_PER_SEC:-} burst=${BURST_NEW_CONNS:-} conns/ip=${MAX_CONNS_PER_IP:-}"
+    echo "  External IP lookup: $([[ "${NO_EXTERNAL_IP_LOOKUP:-0}" == "1" ]] && echo disabled || echo enabled)"
+    echo
+    if [[ -n "${SERVER_IP:-}" && -n "${CLIENT_PORT:-}" && -n "${LINK_SECRET:-}" ]]; then
+      echo "Telegram links:"
+      print_links "$SERVER_IP" "$CLIENT_PORT" "$LINK_SECRET"
+    fi
+  else
+    echo "State file not found: $STATE_FILE"
+  fi
+}
+
+check_cmd(){
+  need_root
+  echo "== Version check =="
+  echo
+  echo "Installer version: $(installer_version || echo "<unknown>")"
+  echo "Installer self-update: ${INSTALLER_SELF_UPDATE}"
+  if [[ -d "${SCRIPT_DIR}/.git" ]] && have_cmd git; then
+    local url
+    url="$(git -C "$SCRIPT_DIR" remote get-url "$INSTALLER_REMOTE" 2>/dev/null || true)"
+    echo "Installer remote (${INSTALLER_REMOTE}): ${url:-<none>}"
+    echo "Trusted remote URL: ${INSTALLER_TRUSTED_REMOTE_URL:-<not set>}"
+  fi
+  echo
+  if [[ -d "${MT_DIR}/.git" ]] && have_cmd git; then
+    echo "MTProxy repo: $MT_DIR"
+    local cur_commit cur_branch
+    cur_commit="$(git_mt rev-parse --short HEAD 2>/dev/null || true)"
+    cur_branch="$(git_mt rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    echo "  Current commit: ${cur_commit:-unknown}"
+    echo "  Current branch: ${cur_branch:-unknown}"
+    if [[ -f "$STATE_FILE" ]]; then
+      # shellcheck disable=SC1090
+      source "$STATE_FILE"
+      echo "  Saved MT_REF: ${MT_REF:-<default-branch>}"
+      echo "  Saved MT_COMMIT: ${MT_COMMIT:-unknown}"
+    fi
+  else
+    echo "MTProxy repo not found at $MT_DIR (not installed yet)."
+  fi
+}
+
+uninstall_cmd(){
+  need_root
+  confirm "This will stop and remove MTProxy service and files. Continue?"
+  log "Uninstalling MTProxy..."
+
+  systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+  systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+  rm -f "$SERVICE_FILE" || true
+  systemctl daemon-reload 2>/dev/null || true
+
+  local p=""
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE" || true
+    p="${CLIENT_PORT:-}"
+  fi
+  if [[ -n "$p" ]]; then
+    have_cmd nft && remove_abuse_nft_existing || true
+    have_cmd iptables && remove_abuse_iptables_for_port "$p" || true
+  fi
+
+  rm -rf "$MT_DIR" || true
+  rm -f "$STATE_FILE" || true
+  id -u "$RUN_USER" >/dev/null 2>&1 && userdel "$RUN_USER" 2>/dev/null || true
+
+  log "Uninstall complete."
+}
+
+# --- install steps ---
 install_deps(){
   export DEBIAN_FRONTEND=noninteractive
   log "Installing dependencies..."
@@ -100,16 +465,14 @@ prepare_user(){
   fi
 }
 
-git_mt(){
-  # Avoid "dubious ownership" without touching global git config
-  git -c safe.directory="$MT_DIR" -C "$MT_DIR" "$@"
-}
-
-clone_and_build(){
-  rm -rf "$MT_DIR"
+clone_and_checkout(){
+  [[ -d "$MT_DIR" ]] && rm -rf "$MT_DIR"
   mkdir -p "$MT_DIR"
+
   log "Cloning MTProxy repo..."
   git clone --recursive "$REPO_URL" "$MT_DIR"
+
+  chown -R "$RUN_USER":"$RUN_USER" "$MT_DIR" || true
 
   if [[ -n "$MT_REF" ]]; then
     log "Pinning MTProxy to ref: $MT_REF"
@@ -119,7 +482,9 @@ clone_and_build(){
   else
     log "MT_REF not set: using default branch (NOT recommended for production)."
   fi
+}
 
+build_mtproxy(){
   local commit
   commit="$(git_mt rev-parse --short HEAD 2>/dev/null || true)"
   log "Building MTProxy (commit: ${commit:-unknown})..."
@@ -129,35 +494,61 @@ clone_and_build(){
 
 download_proxy_files(){
   log "Downloading proxy-secret and proxy-multi.conf..."
-  curl -fL --retry 3 --retry-delay 1 --max-time 20 https://core.telegram.org/getProxySecret -o "$MT_DIR/proxy-secret"
-  curl -fL --retry 3 --retry-delay 1 --max-time 20 https://core.telegram.org/getProxyConfig  -o "$MT_DIR/proxy-multi.conf"
-  chmod 644 "$MT_DIR/proxy-secret" "$MT_DIR/proxy-multi.conf"
+  local secret_url="https://core.telegram.org/getProxySecret"
+  local conf_url="https://core.telegram.org/getProxyConfig"
+  local secret_dst="$MT_DIR/proxy-secret"
+  local conf_dst="$MT_DIR/proxy-multi.conf"
+
+  if have_cmd curl; then
+    curl -fL --retry 3 --retry-delay 1 --max-time 15 "$secret_url" -o "$secret_dst"
+    curl -fL --retry 3 --retry-delay 1 --max-time 15 "$conf_url"   -o "$conf_dst"
+  elif have_cmd wget; then
+    wget -qO "$secret_dst" "$secret_url"
+    wget -qO "$conf_dst" "$conf_url"
+  else
+    die "Neither curl nor wget is available to download proxy files."
+  fi
+
+  if [[ -n "${PROXY_SECRET_SHA256:-}" ]]; then
+    have_cmd sha256sum || die "PROXY_SECRET_SHA256 is set, but sha256sum is not available."
+    echo "${PROXY_SECRET_SHA256}  ${secret_dst}" | sha256sum -c -
+    log "proxy-secret sha256 verified."
+  fi
+
+  chmod 644 "$secret_dst" "$conf_dst"
 }
 
 write_systemd(){
   local raw_secret="$1"
+  local client_port="$2"
+  local stats_port="$3"
   local bin="$MT_DIR/objs/bin/mtproto-proxy"
+
   [[ -x "$bin" ]] || die "mtproto-proxy not found after build."
 
   log "Writing systemd unit: $SERVICE_FILE"
-  cat > "$SERVICE_FILE" <<UNIT
+  cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=MTProxy (Telegram MTProto Proxy)
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 Type=simple
 User=$RUN_USER
 Group=$RUN_USER
 
-# NOTE: do NOT pass -u when running under systemd User=
-ExecStart=$bin -p $STATS_PORT -H $CLIENT_PORT -S $raw_secret --aes-pwd $MT_DIR/proxy-secret $MT_DIR/proxy-multi.conf -M 1
+StateDirectory=mtproxy
+WorkingDirectory=/var/lib/mtproxy
+ReadWritePaths=/var/lib/mtproxy
 
+ExecStart=$bin -u $RUN_USER -p $stats_port -H $client_port -S $raw_secret --aes-pwd $MT_DIR/proxy-secret $MT_DIR/proxy-multi.conf -M 1
 Restart=on-failure
 RestartSec=2
 
-# Hardening (safe defaults)
+LimitNOFILE=1048576
+TasksMax=infinity
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
@@ -167,159 +558,100 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-
-LimitNOFILE=1048576
-TasksMax=infinity
+MemoryDenyWriteExecute=true
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+EOF
 
   systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME" >/dev/null
+  systemctl enable "$SERVICE_NAME"
 }
 
 start_service(){
-  systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
   systemctl restart "$SERVICE_NAME"
-
-  if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-    warn "Service failed to start. Showing logs:"
+  if ! service_active; then
+    log "Service failed to start:"
     systemctl status "$SERVICE_NAME" --no-pager -l || true
-    journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
-
-    warn "If the log shows 'init_common_PID assertion', reboot once after setting pid_max to force PID wrap." 
-    die "mtproxy failed"
+    journalctl -u "$SERVICE_NAME" -n 200 --no-pager || true
+    exit 1
   fi
 }
 
 save_state(){
-  local mt_commit="$1" ip="$2" raw_secret="$3" link_secret="$4"
+  local mt_commit="$1" ip="$2" cport="$3" sport="$4" lsecret="$5"
   umask 077
-  cat > "$STATE_FILE" <<STATE
+  cat > "$STATE_FILE" <<EOF
+# NOTE: This file is readable by root only (0600) and contains the Telegram proxy secret in plaintext.
 MT_REF="$MT_REF"
 MT_COMMIT="$mt_commit"
 SERVER_IP="$ip"
-CLIENT_PORT="$CLIENT_PORT"
-STATS_PORT="$STATS_PORT"
-RAW_SECRET="$raw_secret"
-LINK_SECRET="$link_secret"
+CLIENT_PORT="$cport"
+STATS_PORT="$sport"
+LINK_SECRET="$lsecret"
 MT_DIR="$MT_DIR"
-STATE
+SERVICE_FILE="$SERVICE_FILE"
+RUN_USER="$RUN_USER"
+ANTI_ABUSE="$ANTI_ABUSE"
+ABUSE_BACKEND="$ABUSE_BACKEND"
+ABUSE_BACKEND_PREFERRED="$ABUSE_BACKEND_PREFERRED"
+NEW_CONNS_PER_SEC="$NEW_CONNS_PER_SEC"
+BURST_NEW_CONNS="$BURST_NEW_CONNS"
+MAX_CONNS_PER_IP="$MAX_CONNS_PER_IP"
+NO_EXTERNAL_IP_LOOKUP="$NO_EXTERNAL_IP_LOOKUP"
+EOF
   chmod 600 "$STATE_FILE" || true
 }
 
-print_links(){
-  local ip="$1" port="$2" secret="$3"
-  echo "tg://proxy?server=$ip&port=$port&secret=$secret"
-  echo "https://t.me/proxy?server=$ip&port=$port&secret=$secret"
-}
-
-print_commands(){
-  cat <<EOF
-Available commands:
-  sudo ./${0##*/} status
-  sudo ./${0##*/} check
-  sudo systemctl status mtproxy --no-pager -l
-  sudo journalctl -u mtproxy -f
-  sudo systemctl restart mtproxy
-  sudo ./${0##*/} uninstall
-EOF
-}
-
-status_cmd(){
+install_fresh(){
   need_root
-  systemctl status "$SERVICE_NAME" --no-pager -l || true
-  echo
-  have_cmd ss && ss -lntp | grep -E "(:${CLIENT_PORT}\\b|:${STATS_PORT}\\b).*mtproto-proxy" || true
-  echo
-  [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || true
-}
-
-check_cmd(){
-  need_root
-  echo "== Version check =="
-  echo
-  local script_dir
-  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
-  if command -v git >/dev/null 2>&1 && git -C "$script_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    echo "Installer version: $(git -C "$script_dir" describe --tags --always --dirty 2>/dev/null || echo "<unknown>")"
-    echo "Installer remote (origin): $(git -C "$script_dir" remote get-url origin 2>/dev/null || echo "<none>")"
-  else
-    echo "Installer version: <unknown> (not a git clone)"
-  fi
-
-  echo
-  if [[ -d "${MT_DIR}/.git" ]] && command -v git >/dev/null 2>&1; then
-    echo "MTProxy repo: ${MT_DIR}"
-    echo "  Current commit: $(git -c safe.directory="${MT_DIR}" -C "${MT_DIR}" rev-parse --short HEAD 2>/dev/null || echo "<unknown>")"
-    echo "  Current branch: $(git -c safe.directory="${MT_DIR}" -C "${MT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "<unknown>")"
-  else
-    echo "MTProxy repo: <not installed>"
-  fi
-}
-
-uninstall_cmd(){
-  need_root
-  confirm "This will stop and remove MTProxy. Continue?"
-  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-  systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-  rm -f "$SERVICE_FILE"
-  systemctl daemon-reload 2>/dev/null || true
-  rm -rf "$MT_DIR" "$STATE_FILE"
-  log "Uninstalled."
-}
-
-main(){
-  need_root
-
-  case "${1:-}" in
-    status) status_cmd; exit 0;;
-    check) check_cmd; exit 0;;
-    uninstall) uninstall_cmd; exit 0;;
-    -h|--help)
-      cat <<'HELP'
-Usage:
-  sudo ./install.sh              # install / reinstall
-  sudo ./install.sh status
-  sudo ./install.sh check
-  sudo ./install.sh uninstall
-
-Env overrides:
-  MT_REF=<tag|commit>   SERVER_IP=<public ip>
-  CLIENT_PORT=8443      STATS_PORT=8888
-  YES=1                 # non-interactive
-HELP
-      exit 0;;
-  esac
-
   install_deps
   prepare_user
 
-  [[ -z "$SERVER_IP" ]] && SERVER_IP="$(detect_public_ipv4 || true)"
-  [[ -z "$SERVER_IP" ]] && die "Could not detect public IP. Set SERVER_IP=..."
+  pid_max_warn_and_fix
 
-  ensure_pid_max
+  [[ -z "$SERVER_IP" ]] && SERVER_IP="$(detect_public_ipv4 || true)"
+  [[ -z "$SERVER_IP" ]] && die "Could not detect public IPv4. Use --ip."
+
+  if [[ -n "$CLIENT_PORT" ]]; then
+    [[ "$CLIENT_PORT" == "443" ]] && die "Client port 443 is not allowed."
+    [[ "$CLIENT_PORT" =~ ^[0-9]+$ ]] || die "Invalid client port."
+    is_tcp_port_free "$CLIENT_PORT" || die "Client port busy."
+  else
+    CLIENT_PORT="$(pick_free_port CANDIDATE_CLIENT_PORTS)" || die "No free client port."
+  fi
+
+  if [[ -n "$STATS_PORT" ]]; then
+    [[ "$STATS_PORT" =~ ^[0-9]+$ ]] || die "Invalid stats port."
+    is_tcp_port_free "$STATS_PORT" || die "Stats port busy."
+  else
+    STATS_PORT="$(pick_free_port CANDIDATE_STATS_PORTS)" || die "No free stats port."
+  fi
 
   log "Using IP: $SERVER_IP"
-  log "Ports: client(-H)=$CLIENT_PORT, stats(-p)=$STATS_PORT"
+  log "Chosen ports: client(-H)=$CLIENT_PORT, stats(-p)=$STATS_PORT"
 
+  clone_and_checkout
   local mt_commit
-  mt_commit="$(clone_and_build)"
+  mt_commit="$(build_mtproxy)"
   download_proxy_files
 
   local raw_secret link_secret
   raw_secret="$(head -c 16 /dev/urandom | xxd -ps -c 32)"
   link_secret="dd${raw_secret}"
+  log "Service secret (-S): $raw_secret"
+  log "Link secret (dd...): $link_secret"
 
-  write_systemd "$raw_secret"
+  write_systemd "$raw_secret" "$CLIENT_PORT" "$STATS_PORT"
   start_service
 
-  save_state "$mt_commit" "$SERVER_IP" "$raw_secret" "$link_secret"
+  apply_anti_abuse_if_enabled "$CLIENT_PORT"
+
+  save_state "$mt_commit" "$SERVER_IP" "$CLIENT_PORT" "$STATS_PORT" "$link_secret"
 
   log ""
   log "MTProxy installed and running."
+  log "MT_REF: ${MT_REF:-<default-branch>}"
   log "MT_COMMIT: ${mt_commit:-unknown}"
   log "IP: $SERVER_IP"
   log "Port: $CLIENT_PORT"
@@ -328,7 +660,82 @@ HELP
   log "Telegram links:"
   print_links "$SERVER_IP" "$CLIENT_PORT" "$link_secret"
   echo
+  firewall_connectivity_hint "$CLIENT_PORT"
   print_commands
+}
+
+usage(){
+cat <<'EOF'
+MTProxy Installer (Ubuntu / Debian)
+
+Quick install:
+  git clone https://github.com/someonelikedani/MTProxy-installer.git
+  cd MTProxy-installer
+  sudo ./install.sh
+
+Commands:
+  sudo ./install.sh status
+  sudo ./install.sh check
+  sudo ./install.sh uninstall
+
+Options:
+  --ref <TAG|COMMIT>         Pin MTProxy to exact tag/commit (recommended)
+  --ip <PUBLIC_IP>
+  --no-external-ip           Do not query external IP services (only local routing)
+  --client-port <PORT>       (not 443)
+  --stats-port <PORT>
+  --yes                      Assume "yes" for confirmations (non-interactive safe)
+
+Optional anti-abuse (WILL modify firewall rules):
+  --anti-abuse
+  --abuse-backend auto|nft|iptables
+  --new-conns-per-sec <N>
+  --burst <N>
+  --max-conns-per-ip <N>     (iptables only; 0 disables)
+
+Optional proxy-secret verification:
+  PROXY_SECRET_SHA256="<EXPECTED_SHA256>" sudo ./install.sh
+
+Self-update (safe by default):
+  export INSTALLER_TRUSTED_REMOTE_URL="https://github.com/someonelikedani/MTProxy-installer.git"
+EOF
+}
+
+main(){
+  need_root
+
+  case "${1:-}" in
+    status) shift; status_cmd; exit 0;;
+    check) shift; check_cmd; exit 0;;
+    uninstall) shift; uninstall_cmd; exit 0;;
+    -h|--help) usage; exit 0;;
+  esac
+
+  # Parse CLI args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ref) MT_REF="${2:-}"; shift 2;;
+      --ip) SERVER_IP="${2:-}"; shift 2;;
+      --no-external-ip) NO_EXTERNAL_IP_LOOKUP="1"; shift 1;;
+      --client-port) CLIENT_PORT="${2:-}"; shift 2;;
+      --stats-port) STATS_PORT="${2:-}"; shift 2;;
+      --yes) YES="1"; shift 1;;
+
+      --anti-abuse) ANTI_ABUSE="1"; shift 1;;
+      --abuse-backend) ABUSE_BACKEND_PREFERRED="${2:-auto}"; shift 2;;
+      --new-conns-per-sec) NEW_CONNS_PER_SEC="${2:-}"; shift 2;;
+      --burst) BURST_NEW_CONNS="${2:-}"; shift 2;;
+      --max-conns-per-ip) MAX_CONNS_PER_IP="${2:-}"; shift 2;;
+
+      --no-self-update) INSTALLER_SELF_UPDATE="0"; shift 1;;
+      -h|--help) usage; exit 0;;
+      *) die "Unknown arg: $1";;
+    esac
+  done
+
+  self_update_if_possible "$@"
+
+  install_fresh
 }
 
 main "$@"
