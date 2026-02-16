@@ -1,5 +1,5 @@
 <!-- Языковой переключатель -->
-[🇷🇺 Русский](README.md) | [🇬🇧 English](README.EN.md)
+🌐 Язык: [Русский](README.md) | [English](README.EN.md)
 
 ---
 # MTProxy Installer (Ubuntu / Debian)
