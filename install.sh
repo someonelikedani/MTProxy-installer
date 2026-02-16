@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# MTProxy Installer (Ubuntu/Debian)
+# Default behavior: DOES NOT touch firewall.
+# Optional minimal anti-abuse protection (rate limits) can be enabled explicitly via --anti-abuse.
+#
+# Key improvements (security/ops):
+# - No global git config changes (no git --global safe.directory)
+# - Optional anti-abuse injects rules into EXISTING firewall chains only (no new hook chains)
+# - Installer self-update is gated by trusted remote URL check (supply-chain hardening)
+# - Public IP detection prefers local routing; external services are best-effort and can be disabled
+
 # MTProxy installer (Ubuntu/Debian)
 # Fixes the common crash:
 #   common/pid.c:42: init_common_PID: Assertion `!(p & 0xffff0000)' failed.
@@ -36,7 +46,7 @@ confirm(){
 detect_public_ipv4(){
   local ip=""
   if have_cmd ip; then
-    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i==\"src\"){print $(i+1); exit}}' || true)"
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
   fi
   ip="${ip//[[:space:]]/}"
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$ip"; return 0; }
@@ -205,6 +215,18 @@ print_links(){
   echo "https://t.me/proxy?server=$ip&port=$port&secret=$secret"
 }
 
+print_commands(){
+  cat <<EOF
+Available commands:
+  sudo ./${0##*/} status
+  sudo ./${0##*/} check
+  sudo systemctl status mtproxy --no-pager -l
+  sudo journalctl -u mtproxy -f
+  sudo systemctl restart mtproxy
+  sudo ./${0##*/} uninstall
+EOF
+}
+
 status_cmd(){
   need_root
   systemctl status "$SERVICE_NAME" --no-pager -l || true
@@ -212,6 +234,30 @@ status_cmd(){
   have_cmd ss && ss -lntp | grep -E "(:${CLIENT_PORT}\\b|:${STATS_PORT}\\b).*mtproto-proxy" || true
   echo
   [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || true
+}
+
+check_cmd(){
+  need_root
+  echo "== Version check =="
+  echo
+  local script_dir
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+  if command -v git >/dev/null 2>&1 && git -C "$script_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Installer version: $(git -C "$script_dir" describe --tags --always --dirty 2>/dev/null || echo "<unknown>")"
+    echo "Installer remote (origin): $(git -C "$script_dir" remote get-url origin 2>/dev/null || echo "<none>")"
+  else
+    echo "Installer version: <unknown> (not a git clone)"
+  fi
+
+  echo
+  if [[ -d "${MT_DIR}/.git" ]] && command -v git >/dev/null 2>&1; then
+    echo "MTProxy repo: ${MT_DIR}"
+    echo "  Current commit: $(git -c safe.directory="${MT_DIR}" -C "${MT_DIR}" rev-parse --short HEAD 2>/dev/null || echo "<unknown>")"
+    echo "  Current branch: $(git -c safe.directory="${MT_DIR}" -C "${MT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "<unknown>")"
+  else
+    echo "MTProxy repo: <not installed>"
+  fi
 }
 
 uninstall_cmd(){
@@ -230,12 +276,14 @@ main(){
 
   case "${1:-}" in
     status) status_cmd; exit 0;;
+    check) check_cmd; exit 0;;
     uninstall) uninstall_cmd; exit 0;;
     -h|--help)
       cat <<'HELP'
 Usage:
   sudo ./install.sh              # install / reinstall
   sudo ./install.sh status
+  sudo ./install.sh check
   sudo ./install.sh uninstall
 
 Env overrides:
@@ -279,6 +327,8 @@ HELP
   echo
   log "Telegram links:"
   print_links "$SERVER_IP" "$CLIENT_PORT" "$link_secret"
+  echo
+  print_commands
 }
 
 main "$@"
