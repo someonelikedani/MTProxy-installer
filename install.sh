@@ -507,7 +507,7 @@ StateDirectory=mtproxy
 WorkingDirectory=/var/lib/mtproxy
 ReadWritePaths=/var/lib/mtproxy
 
-ExecStart=$bin -u $RUN_USER -p $stats_port -H $client_port -S $raw_secret --aes-pwd $MT_DIR/proxy-secret $MT_DIR/proxy-multi.conf -M 1
+ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy -p 8888 -H 8443 -S <secret> --aes-pwd /opt/MTProxy/proxy-secret /opt/MTProxy/proxy-multi.conf -M 1
 Restart=on-failure
 RestartSec=2
 
