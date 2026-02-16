@@ -3,7 +3,7 @@
 Production-ready installer for private Telegram MTProto Proxy on
 Ubuntu/Debian VPS.
 
-Upstream: https://github.com/TelegramMessenger/MTProxy\
+Upstream: https://github.com/TelegramMessenger/MTProxy
 Repository: https://github.com/someonelikedani/MTProxy-installer
 
 ------------------------------------------------------------------------
@@ -14,11 +14,11 @@ This project provides a private MTProxy installer for Ubuntu/Debian VPS.
 
 The script:
 
--   builds MTProxy from source\
--   creates a systemd unit\
--   enables auto-start\
--   securely stores installation state\
--   optionally enables minimal anti-abuse protection\
+-   builds MTProxy from source
+-   creates a systemd unit
+-   enables auto-start
+-   securely stores installation state
+-   optionally enables minimal anti-abuse protection
 -   prints ready-to-use Telegram proxy links
 
 Designed for private MTProxy usage on VPS with minimal system intrusion.
@@ -27,11 +27,11 @@ Designed for private MTProxy usage on VPS with minimal system intrusion.
 
 ## 🧩 Design goals
 
--   Minimal system changes\
--   No hidden firewall modifications\
--   Deterministic builds (pin by tag/commit)\
--   Explicit and transparent security model\
--   No changes to global git configuration\
+-   Minimal system changes
+-   No hidden firewall modifications
+-   Deterministic builds (pin by tag/commit)
+-   Explicit and transparent security model
+-   No changes to global git configuration
 -   Uses safe local override `git -c safe.directory=...`
 
 ------------------------------------------------------------------------
@@ -46,17 +46,17 @@ sudo ./install.sh
 
 After installation, the script prints:
 
--   Server IP\
--   Port\
--   Secret\
+-   Server IP
+-   Port
+-   Secret
 -   Ready-to-use Telegram proxy links
 
 ```{=html}
 <!-- -->
-```
+
     tg://proxy?server=IP&port=PORT&secret=SECRET
     https://t.me/proxy?server=IP&port=PORT&secret=SECRET
-
+```
 You can immediately add the proxy to Telegram.
 
 ------------------------------------------------------------------------
@@ -73,13 +73,13 @@ Allows pinning MTProxy to a specific tag or commit.
 
 ## 📦 What the installer does
 
--   Installs required dependencies\
--   Clones official MTProxy\
--   Optionally pins a specific version\
--   Builds binary from source\
--   Creates systemd service `mtproxy`\
--   Enables auto-start\
--   Stores parameters in `/etc/mtproxy-installer.env`\
+-   Installs required dependencies
+-   Clones official MTProxy
+-   Optionally pins a specific version
+-   Builds binary from source
+-   Creates systemd service `mtproxy`
+-   Enables auto-start
+-   Stores parameters in `/etc/mtproxy-installer.env`
 -   Prints working proxy links
 
 ------------------------------------------------------------------------
