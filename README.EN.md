@@ -4,7 +4,6 @@ Production-ready installer for private Telegram MTProto Proxy on
 Ubuntu/Debian VPS.
 
 Upstream: https://github.com/TelegramMessenger/MTProxy
-
 Repository: https://github.com/someonelikedani/MTProxy-installer
 
 ------------------------------------------------------------------------
