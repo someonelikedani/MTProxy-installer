@@ -141,10 +141,11 @@ sudo ./install.sh uninstall
 
 ## 🧾 CLI Flags
 
-  Флаг                 Назначение
-  -------------------- ------------------------------------
-  `--ref`              Фиксация версии MTProxy
-  `--anti-abuse`       Включить минимальный rate limiting
-  `--abuse-backend`    nft / iptables backend
-  `--yes`              Неинтерактивный режим
-  `--no-external-ip`   Отключить внешние IP fallback
+| Флаг | Назначение |
+|------|------------|
+| `--ref` | Фиксация версии MTProxy |
+| `--anti-abuse` | Включить минимальный rate limiting |
+| `--abuse-backend` | nft / iptables backend |
+| `--yes` | Неинтерактивный режим |
+| `--no-external-ip` | Отключить внешние IP fallback |
+
