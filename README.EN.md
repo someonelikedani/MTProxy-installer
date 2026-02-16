@@ -140,10 +140,11 @@ sudo ./install.sh uninstall
 
 ## 🧾 CLI Flags
 
-  Flag                 Purpose
-  -------------------- ------------------------------
-  `--ref`              Pin MTProxy version
-  `--anti-abuse`       Enable minimal rate limiting
-  `--abuse-backend`    nft / iptables backend
-  `--yes`              Non-interactive mode
-  `--no-external-ip`   Disable external IP fallback
+| Flag | Purpose |
+|------|----------|
+| `--ref` | Pin MTProxy to a specific tag or commit |
+| `--anti-abuse` | Enable minimal connection rate limiting |
+| `--abuse-backend` | Select firewall backend: `auto`, `nft`, or `iptables` |
+| `--yes` | Non-interactive mode (assume "yes" for confirmations) |
+| `--no-external-ip` | Disable external IP detection fallback |
+
