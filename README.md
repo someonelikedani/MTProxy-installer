@@ -54,6 +54,7 @@ sudo ./install.sh
 -   порт
 -   secret
 -   готовые ссылки подключения для Telegram
+
     tg://proxy?server=IP&port=PORT&secret=SECRET
     https://t.me/proxy?server=IP&port=PORT&secret=SECRET
 
