@@ -1,0 +1,14 @@
+.DS_Store
+*.log
+*.tmp
+*.swp
+
+# Editors
+.idea/
+.vscode/
+
+# Local env / artifacts
+*.env
+dist/
+build/
+*.zip
