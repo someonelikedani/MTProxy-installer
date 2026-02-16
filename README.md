@@ -1,3 +1,7 @@
+<!-- Языковой переключатель -->
+[🇷🇺 Русский](README.md) | [🇬🇧 English](README.EN.md)
+
+---
 # MTProxy Installer (Ubuntu / Debian)
 
 Production-ready installer for private Telegram MTProto Proxy on
