@@ -133,7 +133,7 @@ sudo ./install.sh check
 sudo systemctl status mtproxy --no-pager -l
 sudo journalctl -u mtproxy -f
 sudo systemctl restart mtproxy
-sudo ./install.sh uninstall
+sudo ./uninstall.sh
 ```
 
 ------------------------------------------------------------------------
